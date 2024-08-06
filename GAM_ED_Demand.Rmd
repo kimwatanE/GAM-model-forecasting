@@ -1,0 +1,364 @@
+---
+title: "GAM_modelling_ED_demand"
+author: "Eric Kimwatan"
+date: "01/11/2020"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##Scenario. This work attemps to model the demand for Emergency Departments for hospitals in Australia by looking at weather patterns. This experiment is intended to be potentially used by hospital staff to make better duty rosters and ensure understaffing or overstaffing does not happen by predicting the number of patients who will be seeking medical services.
+The data used is the Emergency departments admissions and attendance dataset provided by the Department of Health of Western Australia and daily temperature and precipitation data from the NOAA api.
+
+The experiment will first fit a simple linear model on the data to act as a benchmark before fitting a GAM with different features included to improve the fit.
+
+#Getting weather data from the API
+```{r}
+library(tidyverse)
+library(lubridate)
+library(stringr)
+library(modelr)
+library(mgcv)
+library(RcppRoll)
+library(mosaic)
+library(broom)
+library(rnoaa)
+options(noaakey = "awBlPSatjgPreMKXNssYEJaLiGaaEYzC")
+
+```
+
+#Getting weather data
+```{r}
+library(tidyverse)
+options(key = "CBJBOblhZDRjQBLyEmDxDgWgRlVbknlU")
+
+data = data.frame((ghcnd_search("ASN00009021", date_min = "2013-07-01", date_max = "2014-06-30", var <- c("PRCP", "TMAX","TMIN" ))))
+
+data_sel = data[c("prcp.date", "prcp.prcp",  "tmax.tmax", "tmin.tmin")]
+
+data_sel = data_sel %>% rename(Date = prcp.date, Precipitation = prcp.prcp,  TempMax = tmax.tmax, TempMin = tmin.tmin )
+
+  
+write_rds(data_sel, "perth_weather_data.rds")
+```
+```{r}
+library(tidyverse)
+perth_weather_data <- read_rds("perth_weather_data.rds")
+perth_weather_data$Date= as.POSIXct(perth_weather_data$Date, format="%d-%h-%y", tz="GMT")
+```
+
+
+#Getting Emergency Department Data
+
+Data can be downloaded from https://data.gov.au/dataset/6bfec5ea-207e-4d67-8965-c7e72290844b/resource/33d84954-b13a-4f4e-afb9-6468e287fa3c/download/govhack3.csv
+
+Preprocessing the data
+```{r}
+ed_data_link <- 'dataset.csv'
+top_row <- read_csv(ed_data_link, col_names = FALSE, n_max = 1)
+second_row <- read_csv(ed_data_link, n_max = 1)
+
+column_names <- second_row %>% 
+  unlist(., use.names=FALSE) %>% 
+  make.unique(., sep = "__") # double underscore
+
+column_names[2:8] <- str_c(column_names[2:8], '0', sep='__')
+
+daily_attendance <- 
+  read_csv(ed_data_link, skip = 2, col_names = column_names)
+
+#Tidying the data using gather and spread
+attendance=daily_attendance%>%
+  gather(key=Event, value=Numbers, 2:64)
+
+#Splitting the columns
+attendance_sep=attendance %>%
+  separate(col = Event, into = c("case", "hospital"),
+                        sep="__", convert = TRUE)
+
+attendance_tidy= attendance_sep%>%
+  spread(key = case, value= Numbers)
+
+#replacing hospital numbers with hospital names
+attendance_tidy$hospital=recode(attendance_tidy$hospital, '0' = "Royal Perth Hospital", '1'="Fremantle Hospital", '2'="Princess Margaret Hospital For Children", '3'="King Edward Memorial Hospital For Women", '4'="Sir Charles Gairdner Hospital", '5'="Armadale/Kelmscott District Memorial Hospital", '6'="Swan District Hospital", '7'="Rockingham General Hospital", '8'="Joondalup Health Campus")
+
+attendance_tidy$Date= as.POSIXct(attendance_tidy$Date, format="%d-%h-%y", tz="GMT")
+attendance_tidy[, 3:9]=sapply(attendance_tidy[,3:9], as.numeric)
+```
+Checking for nulls. I am interested in the 'Attendance' column which has no nulls.
+```{r}
+sapply(attendance_tidy, function(x) sum(is.na(x)))
+```
+Filtering only data from 'Royal Perth Hospital' and saving to disk
+```{r}
+royal_perth=attendance_tidy%>%
+  filter(hospital=="Royal Perth Hospital")
+
+
+write_rds(attendance_tidy, "perth_ed_data.rds")
+
+```
+
+Read ED Data and Merge with weather data
+```{r}
+ed_data <- read_rds("perth_ed_data.rds")
+
+ed_data$Date= as.POSIXct(ed_data$Date, format="%d-%h-%y", tz="GMT")
+
+ed_data_proc <- ed_data %>% 
+  mutate(wkday = lubridate::wday(Date, 
+                      label = TRUE)) %>% 
+  mutate(wkday_n = lubridate::wday(Date), 
+         wkday_c = factor(lubridate::wday(Date, 
+                               label = TRUE), 
+                          ordered = FALSE )) %>%
+  filter(hospital=="Royal Perth Hospital") %%
+  dplyr::arrange(Date)
+
+
+```
+```{r}
+
+
+ed_data_proc = ed_data_proc %>% dplyr::arrange(Date)
+perth_weather_data = perth_weather_data %>% dplyr::arrange(Date)
+
+
+df_merged = inner_join(ed_data_proc, perth_weather_data, by="Date")
+```
+
+#Fitting a simple linear model on Attendance and Date
+```{r}
+
+#period = nrows(df_merged)
+
+rph = df_merged %>%
+  mutate(att_lag = lag(Attendance),
+         date_num = as.numeric(Date))
+
+rph %>%
+  ggplot(aes(x = Date, y = Attendance)) + 
+  geom_point()
+
+rph_model_1 = lm(Attendance ~ Date, data = rph)
+
+rph_model_1 = augment(rph_model_1)
+
+
+
+```
+```{r}
+#Checking Linear model assumptions
+
+#Linearity
+
+rph_model_1 %>%
+  ggplot(aes(x = .fitted, y = .resid)) +
+  geom_hline(yintercept = 0, colour = "steelblue") + 
+  geom_point() +
+  geom_smooth(se = FALSE)
+
+
+#Constant variance
+rph_model_1 %>% 
+  ggplot(aes(x = Date, y = .resid)) + 
+  geom_hline(yintercept = 0, colour = "steelblue") +
+  geom_point()
+
+
+rph_model_1 %>% 
+  ggplot(aes(x = .fitted, y = .resid)) + 
+  geom_hline(yintercept = 0, colour = "steelblue") +
+  geom_point()
+
+# Normality assumption
+rph_model_1 %>% 
+  ggplot(aes(sample = .std.resid)) +
+  stat_qq() +
+  geom_abline(colour = "steelblue")
+```
+
+Fitting a GAM model on Attendance and date
+```{r}
+rph_mod2 <- gam(Attendance ~ s(date_num), data = rph)
+```
+```{r}
+#function to visualize the fitted values
+library(broom)
+vis_fitted <- function (df) {
+  df1 <- as.tibble(df$model$date_num) %>%
+  rename(date_num = value) %>%                 
+  mutate(df$model$Attendance) %>%
+  rename(Attendance = 'df$model$Attendance') %>%
+  mutate(df$fitted.values) %>%
+  rename(.fitted = 'df$fitted.values')
+
+  df1 %>%
+  mutate(date_c = zoo::as.Date(date_num)) %>% 
+  gather(key = type, 
+         value = value, 
+         Attendance, 
+         .fitted) %>% 
+  ggplot() + 
+  geom_line(aes(x=date_c, 
+                y = value, 
+                colour = type), 
+            size=1, 
+            alpha=0.4)
+}
+
+vis_fitted(rph_mod2)
+
+gam.check(rph_mod2)
+
+ggplot(rph,aes(x=date_num,y=rph_mod2$residual))+geom_point()+geom_quantile()+geom_smooth(colour='firebrick')
+
+
+```
+
+Include Weekly seasonality in the GAM model
+```{r}
+
+rph_model_3 <- gam(Attendance ~ s(date_num) + wkday_n, data = rph)
+
+vis_fitted(rph_model_3)
+
+as.tibble(factor(rph_model_3$model$wkday_n)) %>%
+mutate(rph_model_3$residuals) %>%
+rename(residuals = 'rph_model_3$residuals') %>%
+rename(day_of_week = value) %>%
+  ggplot(aes(day_of_week, residuals)) + geom_boxplot()
+
+#comparing model performance with and without weekly seasonality
+AIC(rph_mod2)
+AIC(rph_model_3)
+
+
+#plotting the smoothe term
+rph_model_3 %>%
+  plot()
+
+
+#Coefficients
+
+rph_model_3 %>%
+  tidy(parametric = TRUE)
+```
+
+Assessing model residuals
+```{r}
+gam.check(rph_model_3)
+```
+
+
+#Include EHF as a predictor.
+EHF(Excessive Heat Factor is a measure for heatwave). Australia is known to have servere heatwaves that are usually hazardous. This paper argues that more human lives are lost to heatwaves in australia than bushfires. 
+https://www.mdpi.com/1660-4601/12/1/227
+
+```{r}
+
+library(rnoaa)
+options(noaakey = "awBlPSatjgPreMKXNssYEJaLiGaaEYzC")
+
+```
+```{r}
+# Create the variables T95 and T05.
+
+get_ghcnd_year <- function(station_id, yr){
+  bind_rows(
+    ncdc(datasetid = 'GHCND', 
+         stationid = station_id, 
+         startdate = str_c(yr, '-01-01'),
+         enddate = str_c(yr, '-06-30'), 
+         limit = 1000)$data,
+    ncdc(datasetid = 'GHCND', 
+         stationid = station_id, 
+         startdate = str_c(yr, '-07-01'),
+         enddate = str_c(yr, '-12-31'), 
+         limit = 1000)$data
+  )
+}
+```
+```{r}
+reference_daily_data <- map(1971:2000, ~get_ghcnd_year('GHCND:ASN00009021', .)) %>% bind_rows()
+```
+```{r}
+write_rds(reference_daily_data, "perth_climate_reference_1971_2000.rds")
+```
+```{r}
+ref_temps <- reference_daily_data %>% 
+  spread(datatype, value) %>% 
+  mutate(TAVG = (TMAX + TMIN)/10/2) 
+
+ref_temps1 <- ref_temps %>% 
+  summarise(T_95p=quantile(TAVG, probs = 0.95, na.rm = T),
+            T_05p=quantile(TAVG, probs = 0.05, na.rm = T))
+
+write_rds(ref_temps1, "perth_climate_reference_temp.rds")
+```
+```{r}
+reference_daily_data <- read_rds("perth_climate_reference_1971_2000.rds")
+ref_temps <- read_rds("perth_climate_reference_temp.rds")
+ref_temps
+```
+```{r}
+perth_daily_data <-  map(2013:2014, 
+                         ~get_ghcnd_year('GHCND:ASN00009021', .)) %>% 
+  bind_rows()
+
+perth_daily_data <- perth_daily_data %>% 
+  mutate(date = as.Date(date)) %>% 
+  dplyr::select(date, 
+         datatype, 
+         value) %>% 
+  spread(datatype, 
+         value) %>% 
+  mutate(TAVG_D = (TMAX + lead(TMIN))/10/2) %>% # The daily average used by John R. Nairn .
+  mutate(AVG_3d = roll_meanl(TAVG_D, n = 3)) %>% 
+  mutate(AVG_30d = roll_meanr(lag(TAVG_D), n = 30)) %>%
+  mutate(EHI_sig = AVG_3d - ref_temps$T_95p,
+         EHI_accl = AVG_3d - AVG_30d) %>% 
+  mutate(EHI = EHI_sig * pmax(1, EHI_accl))
+
+perth_daily_data
+
+
+perth_daily_data %>% 
+  ggplot(aes(x = date, 
+             y = EHI)) + 
+  geom_line()
+```
+```{r}
+rph <- rph %>% 
+  mutate(Date = as.Date(Date))
+
+
+df_ehf = rph %>%
+  mutate(att_3d = roll_suml(Attendance, n=3)) %>%
+  left_join(perth_daily_data, 
+            by=c("Date"="date"))
+
+
+rph_ehi_mod = gam(Attendance ~ s(date_num) + wkday + s(EHI), data = df_ehf)
+```
+```{r}
+vis_fitted(rph_ehi_mod)
+```
+```{r}
+plot(rph_ehi_mod)
+```
+```{r}
+AIC(rph_ehi_mod)
+```
+The GAM model with the EHI factor fits the data better than the other models
+```{r}
+tinytex::install_tinytex()
+```
+
+
+
+
